@@ -1,0 +1,7 @@
+flask==3.0.0
+gunicorn==21.2.0
+easyocr==1.7.1
+pillow==10.2.0
+numpy==1.26.3
+torch==2.1.0
+torchvision==0.16.0
