@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install Tesseract OCR (much lighter than EasyOCR)
+# Install Tesseract OCR
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     tesseract-ocr-eng \
@@ -19,5 +19,5 @@ COPY . .
 # Expose port
 EXPOSE 5000
 
-# Run with gunicorn (single worker to save memory)
+# Run with gunicorn
 CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--timeout", "60", "--workers", "1", "--threads", "2", "app:app"]

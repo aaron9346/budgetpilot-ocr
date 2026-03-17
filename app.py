@@ -3,7 +3,7 @@ import pytesseract
 import base64
 import io
 import re
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 from datetime import datetime
 
 app = Flask(__name__)
@@ -15,7 +15,7 @@ def home():
     return jsonify({
         "service": "BudgetPilot OCR",
         "status": "running",
-        "version": "2.0-lite"
+        "version": "2.1"
     })
 
 @app.route('/health', methods=['GET'])
@@ -37,25 +37,62 @@ def parse_screenshot():
         except Exception as e:
             return jsonify({"error": f"Invalid image: {str(e)}", "amount": None}), 400
         
-        # Convert to RGB if necessary
+        # Convert to RGB
         if image.mode != 'RGB':
             image = image.convert('RGB')
         
-        # Run Tesseract OCR
-        full_text = pytesseract.image_to_string(image)
+        print(f"Image size: {image.size}")
         
-        print(f"OCR Text: {full_text[:300]}...")
+        # Try multiple OCR strategies
+        all_text = ""
         
-        # Parse payment details
-        parsed = parse_payment_text(full_text)
-        parsed['raw_text'] = full_text[:500]
+        # Strategy 1: Original image
+        text1 = pytesseract.image_to_string(image)
+        all_text += " " + text1
+        print(f"Strategy 1 (original): {text1[:200]}...")
         
-        print(f"Parsed: amount={parsed['amount']}, merchant={parsed['merchant']}")
+        # Strategy 2: Grayscale + Contrast
+        gray = image.convert('L')
+        enhancer = ImageEnhance.Contrast(gray)
+        high_contrast = enhancer.enhance(2.0)
+        text2 = pytesseract.image_to_string(high_contrast)
+        all_text += " " + text2
+        print(f"Strategy 2 (contrast): {text2[:200]}...")
+        
+        # Strategy 3: Resize larger (helps with small text)
+        width, height = image.size
+        if width < 1000:
+            scale = 1500 / width
+            new_size = (int(width * scale), int(height * scale))
+            resized = image.resize(new_size, Image.LANCZOS)
+            text3 = pytesseract.image_to_string(resized)
+            all_text += " " + text3
+            print(f"Strategy 3 (resized): {text3[:200]}...")
+        
+        # Strategy 4: Sharpen
+        sharpened = image.filter(ImageFilter.SHARPEN)
+        text4 = pytesseract.image_to_string(sharpened)
+        all_text += " " + text4
+        print(f"Strategy 4 (sharpened): {text4[:200]}...")
+        
+        # Combine all text and parse
+        print(f"\n=== COMBINED TEXT ===\n{all_text[:500]}")
+        
+        parsed = parse_payment_text(all_text)
+        parsed['raw_text'] = all_text[:800]
+        
+        print(f"\n=== PARSED RESULT ===")
+        print(f"Amount: {parsed['amount']}")
+        print(f"Merchant: {parsed['merchant']}")
+        print(f"Date: {parsed['date']}")
+        print(f"Type: {parsed['type']}")
         
         return jsonify(parsed)
         
     except Exception as e:
         print(f"Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e), "amount": None}), 500
 
 
@@ -69,88 +106,99 @@ def parse_payment_text(text):
         "type": None
     }
     
-    # Normalize text
+    # Normalize text - keep more characters for rupee symbol variations
     t = ' '.join(text.split())
     t_lower = t.lower()
     
-    # ═══════════════════════════════════════════════════════
-    # AMOUNT EXTRACTION
-    # ═══════════════════════════════════════════════════════
-    amount_patterns = [
-        r'[₹]\s*([\d,]+(?:\.\d{1,2})?)',              # ₹500.00
-        r'Rs\.?\s*([\d,]+(?:\.\d{1,2})?)',             # Rs. 500
-        r'INR\.?\s*([\d,]+(?:\.\d{1,2})?)',            # INR 500
-        r'[zZ]\s*([\d,]+\.\d{2})',                     # Z10.00 (₹ misread)
-        r'Amount[:\s]*([\d,]+(?:\.\d{1,2})?)',
-        r'Total[:\s]*([\d,]+(?:\.\d{1,2})?)',
-        r'Paid[:\s]*([\d,]+(?:\.\d{1,2})?)',
-        r'Sent[:\s]*([\d,]+(?:\.\d{1,2})?)',
-        r'\b(\d{1,3}(?:,\d{2,3})*\.\d{2})\b',         # 1,00,000.00
-        r'\b(\d+\.\d{2})\b',                           # 10.00
-    ]
+    print(f"\nParsing text length: {len(t)}")
     
-    for pattern in amount_patterns:
-        matches = re.findall(pattern, t, re.IGNORECASE)
-        for match in matches:
-            amount_str = match.replace(',', '')
-            try:
-                amount = float(amount_str)
-                if 0.01 <= amount <= 10000000:
-                    result['amount'] = amount
-                    break
-            except:
-                continue
-        if result['amount']:
-            break
+    # ═══════════════════════════════════════════════════════
+    # AMOUNT EXTRACTION - More aggressive patterns
+    # ═══════════════════════════════════════════════════════
+    
+    # First try to find numbers with .00 pattern (very common in payment apps)
+    decimal_amounts = re.findall(r'(\d{1,6}(?:,\d{2,3})*\.\d{2})', t)
+    print(f"Found decimal amounts: {decimal_amounts}")
+    
+    for amt_str in decimal_amounts:
+        try:
+            amount = float(amt_str.replace(',', ''))
+            if 0.01 <= amount <= 1000000:
+                result['amount'] = amount
+                print(f"Matched amount from decimal pattern: {amount}")
+                break
+        except:
+            continue
+    
+    # If no decimal amount found, try other patterns
+    if not result['amount']:
+        amount_patterns = [
+            r'[₹]\s*([\d,]+(?:\.\d{1,2})?)',              # ₹500.00
+            r'Rs\.?\s*([\d,]+(?:\.\d{1,2})?)',             # Rs. 500
+            r'INR\.?\s*([\d,]+(?:\.\d{1,2})?)',            # INR 500
+            r'%\s*([\d,]+\.\d{2})',                        # % sometimes OCR'd as ₹
+            r'2\s*([\d,]+\.\d{2})',                        # ₹ sometimes OCR'd as 2
+            r'[EF&]\s*([\d,]+\.\d{2})',                    # Other misreads
+            r'Sent\s*[^\d]*([\d,]+(?:\.\d{2})?)',          # Sent 500.00
+            r'Paid\s*[^\d]*([\d,]+(?:\.\d{2})?)',          # Paid 500.00
+            r'Amount[:\s]*([\d,]+(?:\.\d{1,2})?)',         # Amount: 500
+        ]
+        
+        for pattern in amount_patterns:
+            match = re.search(pattern, t, re.IGNORECASE)
+            if match:
+                amt_str = match.group(1).replace(',', '')
+                try:
+                    amount = float(amt_str)
+                    if 0.01 <= amount <= 1000000:
+                        result['amount'] = amount
+                        print(f"Matched amount from pattern '{pattern}': {amount}")
+                        break
+                except:
+                    continue
     
     # ═══════════════════════════════════════════════════════
     # TRANSACTION TYPE
     # ═══════════════════════════════════════════════════════
-    debit_keywords = ['sent', 'paid', 'debited', 'debit', 'payment successful',
-                      'transferred', 'spent', 'money sent']
-    credit_keywords = ['received', 'credited', 'credit', 'added', 'refund', 
-                       'cashback', 'money received']
-    
-    for kw in debit_keywords:
-        if kw in t_lower:
-            result['type'] = 'debit'
-            break
-    
-    if not result['type']:
-        for kw in credit_keywords:
-            if kw in t_lower:
-                result['type'] = 'credit'
-                break
-    
-    if not result['type']:
+    if re.search(r'\b(sent|paid|debited|debit|payment\s+successful|transferred|spent)\b', t_lower):
         result['type'] = 'debit'
+    elif re.search(r'\b(received|credited|credit|added|refund|cashback)\b', t_lower):
+        result['type'] = 'credit'
+    else:
+        result['type'] = 'debit'  # Default
+    
+    print(f"Transaction type: {result['type']}")
     
     # ═══════════════════════════════════════════════════════
-    # MERCHANT/RECIPIENT
+    # MERCHANT/RECIPIENT - Look for name patterns
     # ═══════════════════════════════════════════════════════
-    merchant_patterns = [
-        r'(?:To|Paid to|Sent to)[:\s]+([A-Za-z][A-Za-z0-9\s]{2,30})',
-        r'(?:From|Received from)[:\s]+([A-Za-z][A-Za-z0-9\s]{2,30})',
-        r'([A-Z][A-Z\s]{4,25}[A-Z])\s*[₹zZ]',
-    ]
     
-    for pattern in merchant_patterns:
-        match = re.search(pattern, t, re.IGNORECASE)
-        if match:
-            merchant = match.group(1).strip()
-            merchant = re.sub(r'\s+(on|via|UPI|ref|txn).*$', '', merchant, flags=re.IGNORECASE).strip()
-            if len(merchant) > 2 and not merchant.isdigit():
-                result['merchant'] = merchant[:40]
+    # Pattern 1: ALL CAPS names (common in payment apps)
+    caps_names = re.findall(r'\b([A-Z][A-Z]+(?:\s+[A-Z]+){1,4})\b', t)
+    skip_words = {'SAMSUNG', 'WALLET', 'INDIA', 'BANK', 'AXIS', 'HDFC', 'ICICI', 
+                  'PAYMENT', 'TRANSACTION', 'SUCCESSFUL', 'UPI', 'SENT', 'FROM',
+                  'DATE', 'NOTES', 'THE', 'AND', 'FOR', 'MAR', 'JAN', 'FEB', 'APR',
+                  'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'}
+    
+    for name in caps_names:
+        words = name.split()
+        # Skip if any word is in skip list
+        if not any(w in skip_words for w in words):
+            if len(name) >= 5:  # At least 5 chars
+                result['merchant'] = name
+                print(f"Found merchant (CAPS): {name}")
                 break
     
-    # Look for ALL CAPS name
+    # Pattern 2: "To <Name>" or "Paid to <Name>"
     if not result['merchant']:
-        caps_matches = re.findall(r'\b([A-Z][A-Z\s]{4,25}[A-Z])\b', t)
-        skip_words = ['SAMSUNG', 'WALLET', 'INDIA', 'BANK', 'AXIS', 'HDFC', 
-                     'ICICI', 'PAYMENT', 'TRANSACTION', 'SUCCESSFUL', 'UPI']
-        for m in caps_matches:
-            if not any(sw in m for sw in skip_words):
-                result['merchant'] = m.strip()
+        to_patterns = [
+            r'(?:To|Paid\s+to|Sent\s+to)[:\s]+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3})',
+        ]
+        for pattern in to_patterns:
+            match = re.search(pattern, t)
+            if match:
+                result['merchant'] = match.group(1).strip()
+                print(f"Found merchant (To pattern): {result['merchant']}")
                 break
     
     # ═══════════════════════════════════════════════════════
@@ -161,31 +209,21 @@ def parse_payment_text(text):
         'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
     }
     
-    date_patterns = [
-        (r'(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s,]+(\d{4})', 'dMy'),
-        (r'(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})', 'dmy'),
-        (r'(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})\b', 'dmy_short'),
-    ]
+    # Pattern: DD MMM YYYY (17 MAR 2026)
+    date_match = re.search(r'(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s,]*(\d{4})', t, re.IGNORECASE)
+    if date_match:
+        day = int(date_match.group(1))
+        month = months_map.get(date_match.group(2).lower()[:3], 1)
+        year = date_match.group(3)
+        if 1 <= day <= 31:
+            result['date'] = f"{day:02d}/{month:02d}/{year}"
+            print(f"Found date: {result['date']}")
     
-    for pattern, fmt in date_patterns:
-        match = re.search(pattern, t, re.IGNORECASE)
-        if match:
-            try:
-                if fmt == 'dMy':
-                    day = int(match.group(1))
-                    month = months_map.get(match.group(2).lower()[:3], 1)
-                    year = match.group(3)
-                elif fmt == 'dmy':
-                    day, month, year = int(match.group(1)), int(match.group(2)), match.group(3)
-                elif fmt == 'dmy_short':
-                    day, month = int(match.group(1)), int(match.group(2))
-                    year = 2000 + int(match.group(3))
-                
-                if 1 <= day <= 31 and 1 <= month <= 12:
-                    result['date'] = f"{day:02d}/{int(month):02d}/{year}"
-                    break
-            except:
-                continue
+    # Fallback: DD/MM/YYYY
+    if not result['date']:
+        date_match = re.search(r'(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})', t)
+        if date_match:
+            result['date'] = f"{date_match.group(1)}/{date_match.group(2)}/{date_match.group(3)}"
     
     if not result['date']:
         result['date'] = datetime.now().strftime('%d/%m/%Y')
