@@ -8,20 +8,17 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# Initialize EasyOCR (English only for speed - add 'hi' for Hindi if needed)
-print("Loading OCR model...")
+# Initialize EasyOCR
+print("Loading OCR model... (this takes ~30 seconds on first run)")
 reader = easyocr.Reader(['en'], gpu=False)
-print("OCR model loaded!")
+print("✅ OCR model loaded!")
 
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
         "service": "BudgetPilot OCR",
         "status": "running",
-        "endpoints": {
-            "/parse": "POST - Parse payment screenshot",
-            "/health": "GET - Health check"
-        }
+        "version": "1.1"
     })
 
 @app.route('/health', methods=['GET'])
@@ -37,34 +34,46 @@ def parse_screenshot():
             return jsonify({"error": "No image provided", "amount": None}), 400
         
         # Decode base64 image
-        image_data = base64.b64decode(data['image'])
-        image = Image.open(io.BytesIO(image_data))
+        try:
+            image_data = base64.b64decode(data['image'])
+            image = Image.open(io.BytesIO(image_data))
+        except Exception as e:
+            return jsonify({"error": f"Invalid image: {str(e)}", "amount": None}), 400
         
         # Convert to RGB if necessary
         if image.mode != 'RGB':
             image = image.convert('RGB')
         
+        print(f"Image size: {image.size}")
+        
         # Run OCR
         results = reader.readtext(image)
         
         # Combine all detected text
-        full_text = ' '.join([r[1] for r in results])
+        texts = [r[1] for r in results]
+        full_text = ' '.join(texts)
         
-        print(f"OCR Text: {full_text[:200]}...")
+        print(f"OCR found {len(texts)} text blocks")
+        print(f"Full text: {full_text[:300]}...")
         
         # Parse payment details
-        parsed = parse_payment_text(full_text)
-        parsed['raw_text'] = full_text[:300]
+        parsed = parse_payment_text(full_text, texts)
+        parsed['raw_text'] = full_text[:500]
+        parsed['text_blocks'] = texts[:20]  # First 20 blocks for debugging
+        
+        print(f"Parsed result: amount={parsed['amount']}, merchant={parsed['merchant']}")
         
         return jsonify(parsed)
         
     except Exception as e:
         print(f"Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e), "amount": None}), 500
 
 
-def parse_payment_text(text):
-    """Extract payment details from OCR text using regex"""
+def parse_payment_text(full_text, text_blocks):
+    """Extract payment details from OCR text"""
     
     result = {
         "amount": None,
@@ -73,46 +82,74 @@ def parse_payment_text(text):
         "type": None
     }
     
-    # Normalize text
-    t = ' '.join(text.split())
+    # Normalize
+    t = ' '.join(full_text.split())
     t_lower = t.lower()
     
     # ═══════════════════════════════════════════════════════
-    # AMOUNT EXTRACTION
+    # AMOUNT EXTRACTION - Multiple strategies
     # ═══════════════════════════════════════════════════════
+    
+    # Strategy 1: Look for ₹ symbol (might be OCR'd as various characters)
     amount_patterns = [
-        r'[₹]\s*([\d,]+(?:\.\d{1,2})?)',                    # ₹500.00
-        r'Rs\.?\s*([\d,]+(?:\.\d{1,2})?)',                   # Rs. 500
-        r'INR\.?\s*([\d,]+(?:\.\d{1,2})?)',                  # INR 500
-        r'Amount[:\s]*([\d,]+(?:\.\d{1,2})?)',               # Amount: 500
-        r'Total[:\s]*[₹Rs\.INR\s]*([\d,]+(?:\.\d{1,2})?)',  # Total: 500
-        r'Paid[:\s]*[₹Rs\.INR\s]*([\d,]+(?:\.\d{1,2})?)',   # Paid 500
-        r'Sent[:\s]*[₹Rs\.INR\s]*([\d,]+(?:\.\d{1,2})?)',   # Sent 500
-        r'Received[:\s]*[₹Rs\.INR\s]*([\d,]+(?:\.\d{1,2})?)', # Received 500
-        r'Debited[:\s]*[₹Rs\.INR\s]*([\d,]+(?:\.\d{1,2})?)', # Debited 500
-        r'Credited[:\s]*[₹Rs\.INR\s]*([\d,]+(?:\.\d{1,2})?)', # Credited 500
-        r'\b([\d,]+\.\d{2})\b'                               # 500.00 fallback
+        # Standard rupee patterns
+        r'[₹]\s*([\d,]+(?:\.\d{1,2})?)',              # ₹500.00
+        r'Rs\.?\s*([\d,]+(?:\.\d{1,2})?)',             # Rs. 500
+        r'INR\.?\s*([\d,]+(?:\.\d{1,2})?)',            # INR 500
+        
+        # OCR might read ₹ as other characters
+        r'[zZ]\s*([\d,]+\.\d{2})',                     # Z10.00 (₹ misread)
+        r'[tTfF]\s*([\d,]+\.\d{2})',                   # Sometimes ₹ becomes t or f
+        r'[\*\#]\s*([\d,]+\.\d{2})',                   # *10.00
+        
+        # Amount with keywords
+        r'Amount[:\s]*([\d,]+(?:\.\d{1,2})?)',
+        r'Total[:\s]*([\d,]+(?:\.\d{1,2})?)',
+        r'Paid[:\s]*([\d,]+(?:\.\d{1,2})?)',
+        r'Sent[:\s]*([\d,]+(?:\.\d{1,2})?)',
+        r'Received[:\s]*([\d,]+(?:\.\d{1,2})?)',
+        
+        # Standalone decimal number (common in payment screenshots)
+        r'\b(\d{1,3}(?:,\d{2,3})*(?:\.\d{2}))\b',      # 1,00,000.00 or 10.00
+        r'\b(\d+\.\d{2})\b',                           # Simple: 10.00
     ]
     
     for pattern in amount_patterns:
-        match = re.search(pattern, t, re.IGNORECASE)
-        if match:
-            amount_str = match.group(1).replace(',', '')
+        matches = re.findall(pattern, t, re.IGNORECASE)
+        for match in matches:
+            amount_str = match.replace(',', '')
             try:
                 amount = float(amount_str)
-                if 0.01 < amount < 10000000:  # Between 1 paisa and 1 crore
+                # Sanity check: reasonable payment amount
+                if 0.01 <= amount <= 10000000:
                     result['amount'] = amount
                     break
             except:
                 continue
+        if result['amount']:
+            break
+    
+    # Strategy 2: If no amount found, look in individual text blocks
+    if not result['amount']:
+        for block in text_blocks:
+            # Look for number with decimal
+            match = re.search(r'(\d+\.\d{2})', block)
+            if match:
+                try:
+                    amount = float(match.group(1))
+                    if 0.01 <= amount <= 10000000:
+                        result['amount'] = amount
+                        break
+                except:
+                    continue
     
     # ═══════════════════════════════════════════════════════
     # TRANSACTION TYPE
     # ═══════════════════════════════════════════════════════
-    debit_keywords = ['sent', 'paid', 'debited', 'debit', 'payment to', 
-                      'transferred', 'spent', 'deducted', 'withdrawn']
-    credit_keywords = ['received', 'credited', 'credit', 'payment from', 
-                       'added', 'refund', 'cashback', 'deposited']
+    debit_keywords = ['sent', 'paid', 'debited', 'debit', 'payment successful',
+                      'transferred', 'spent', 'money sent', 'transaction successful']
+    credit_keywords = ['received', 'credited', 'credit', 'added', 'refund', 
+                       'cashback', 'money received']
     
     for kw in debit_keywords:
         if kw in t_lower:
@@ -125,37 +162,40 @@ def parse_payment_text(text):
                 result['type'] = 'credit'
                 break
     
-    # Default to debit (most screenshots are payments)
     if not result['type']:
-        result['type'] = 'debit'
+        result['type'] = 'debit'  # Default
     
     # ═══════════════════════════════════════════════════════
     # MERCHANT/RECIPIENT
     # ═══════════════════════════════════════════════════════
+    
+    # Look for name patterns
     merchant_patterns = [
-        # "To Name" patterns
-        r'(?:To|Paid to|Sent to|Payment to)[:\s]+([A-Za-z][A-Za-z0-9\s&\'.,\-]{1,35}?)(?:\s+on|\s+via|\s+UPI|\s*[₹]|\s*Rs|\n|$)',
-        # "From Name" patterns (for credits)
-        r'(?:From|Received from|Payment from)[:\s]+([A-Za-z][A-Za-z0-9\s&\'.,\-]{1,35}?)(?:\s+on|\s+via|\s+UPI|\s*[₹]|\s*Rs|\n|$)',
-        # Name before ₹ symbol
-        r'([A-Z][A-Za-z0-9\s]{2,20})\s*[₹]',
-        # UPI ID - extract name part
-        r'([a-zA-Z][a-zA-Z0-9._-]{1,25})@[a-zA-Z]+',
-        # Generic patterns
-        r'Merchant[:\s]+([A-Za-z][A-Za-z0-9\s&\'.,\-]{1,35})',
-        r'Payee[:\s]+([A-Za-z][A-Za-z0-9\s&\'.,\-]{1,35})',
-        r'Beneficiary[:\s]+([A-Za-z][A-Za-z0-9\s&\'.,\-]{1,35})'
+        r'(?:To|Paid to|Sent to)[:\s]+([A-Z][A-Za-z\s]{2,30})',
+        r'(?:From|Received from)[:\s]+([A-Z][A-Za-z\s]{2,30})',
+        r'([A-Z][A-Z\s]{5,30})\s*[₹zZRs]',  # UPPERCASE NAME before amount
     ]
     
     for pattern in merchant_patterns:
-        match = re.search(pattern, t, re.IGNORECASE)
+        match = re.search(pattern, t)
         if match:
             merchant = match.group(1).strip()
             # Clean up
-            merchant = re.sub(r'\s+(on|via|UPI|ref|txn|transaction).*$', '', merchant, flags=re.IGNORECASE).strip()
-            # Validate
-            if len(merchant) > 1 and not merchant.isdigit() and merchant.lower() not in ['to', 'from', 'the', 'a', 'an']:
-                result['merchant'] = merchant[:40]  # Limit length
+            merchant = re.sub(r'\s+', ' ', merchant).strip()
+            if len(merchant) > 2 and not merchant.isdigit():
+                result['merchant'] = merchant[:40]
+                break
+    
+    # Strategy 2: Look for ALL CAPS name (common in payment apps)
+    if not result['merchant']:
+        caps_pattern = r'\b([A-Z][A-Z\s]{4,25}[A-Z])\b'
+        matches = re.findall(caps_pattern, t)
+        for m in matches:
+            # Skip common headers
+            skip_words = ['SAMSUNG', 'WALLET', 'INDIA', 'BANK', 'AXIS', 'HDFC', 
+                         'ICICI', 'PAYMENT', 'TRANSACTION', 'SUCCESSFUL', 'UPI']
+            if not any(sw in m for sw in skip_words):
+                result['merchant'] = m.strip()
                 break
     
     # ═══════════════════════════════════════════════════════
@@ -167,42 +207,34 @@ def parse_payment_text(text):
     }
     
     date_patterns = [
-        # DD/MM/YYYY or DD-MM-YYYY
-        (r'(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})', 'dmy'),
-        # DD MMM YYYY
+        # DD MMM YYYY (17 MAR 2026)
         (r'(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s,]+(\d{4})', 'dMy'),
-        # MMM DD, YYYY
-        (r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{1,2})[\s,]+(\d{4})', 'Mdy'),
-        # DD/MM/YY
-        (r'(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})\b', 'dmy_short')
+        # DD/MM/YYYY
+        (r'(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})', 'dmy'),
+        # DD-MM-YY
+        (r'(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})\b', 'dmy_short'),
     ]
     
     for pattern, fmt in date_patterns:
         match = re.search(pattern, t, re.IGNORECASE)
         if match:
             try:
-                if fmt == 'dmy':
-                    day, month, year = int(match.group(1)), int(match.group(2)), match.group(3)
-                elif fmt == 'dMy':
+                if fmt == 'dMy':
                     day = int(match.group(1))
                     month = months_map.get(match.group(2).lower()[:3], 1)
                     year = match.group(3)
-                elif fmt == 'Mdy':
-                    month = months_map.get(match.group(1).lower()[:3], 1)
-                    day = int(match.group(2))
-                    year = match.group(3)
+                elif fmt == 'dmy':
+                    day, month, year = int(match.group(1)), int(match.group(2)), match.group(3)
                 elif fmt == 'dmy_short':
                     day, month = int(match.group(1)), int(match.group(2))
                     year = 2000 + int(match.group(3))
                 
-                # Validate date
                 if 1 <= day <= 31 and 1 <= month <= 12:
-                    result['date'] = f"{day:02d}/{month:02d}/{year}"
+                    result['date'] = f"{day:02d}/{int(month):02d}/{year}"
                     break
             except:
                 continue
     
-    # Default to today if no date found
     if not result['date']:
         result['date'] = datetime.now().strftime('%d/%m/%Y')
     
